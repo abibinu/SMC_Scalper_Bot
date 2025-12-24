@@ -8,12 +8,16 @@ from config import (
     MAX_ORDER_AGE_MINUTES, BREAKEVEN_TRIGGER_RR,
     ORDER_MANAGEMENT_CHECK_INTERVAL,
     OB_LOOKBACK_CANDLES, MIN_CONFLUENCE_OVERLAP,
-    REQUIRE_CONFLUENCE, MIN_SETUP_QUALITY_SCORE
+    REQUIRE_CONFLUENCE, MIN_SETUP_QUALITY_SCORE,
+    ENABLE_MTF_CONFIRMATION, MTF_TIMEFRAMES,
+    REQUIRE_ALL_TF_ALIGNED, MTF_MIN_ALIGNMENT_PCT,
+    MTF_SCORE_BONUS
 )
 from engine import (
     get_ohlc_data, detect_mss_and_sl, find_fvg,
     find_order_block, check_confluence, get_refined_entry,
-    analyze_setup_quality
+    analyze_setup_quality, get_mtf_structure, check_mtf_alignment,
+    calculate_mtf_score_bonus
 )
 from trading_functions import (
     mt5_connect, verify_demo_account, check_spread, 
@@ -39,11 +43,14 @@ def is_in_trading_session():
 def main():
     """Main function to run the trading bot."""
     print("=" * 60)
-    print("SMC Institutional Scalper Bot v2.0")
+    print("SMC Institutional Scalper Bot v3.0")
     print("=" * 60)
     
     mt5_connect()
     verify_demo_account()
+    
+    # Get account info and display
+    account_info = mt5.account_info()
     
     # Initialize Order Manager
     order_manager = OrderManager(
@@ -53,6 +60,9 @@ def main():
     )
     
     print(f"✓ Bot running on demo account")
+    print(f"✓ Account Balance: ${account_info.balance:,.2f}")
+    print(f"✓ Account Equity: ${account_info.equity:,.2f}")
+    print(f"✓ Free Margin: ${account_info.margin_free:,.2f}")
     print(f"✓ Symbol: {SYMBOL}")
     print(f"✓ Risk per trade: {RISK_PER_TRADE * 100}%")
     print(f"✓ Order expiration: {MAX_ORDER_AGE_MINUTES} minutes")
@@ -61,6 +71,11 @@ def main():
     print(f"✓ Min confluence: {MIN_CONFLUENCE_OVERLAP}%")
     print(f"✓ Require confluence: {'Yes' if REQUIRE_CONFLUENCE else 'No'}")
     print(f"✓ Min setup quality: {MIN_SETUP_QUALITY_SCORE}/100")
+    print(f"✓ MTF Confirmation: {'Enabled' if ENABLE_MTF_CONFIRMATION else 'Disabled'}")
+    if ENABLE_MTF_CONFIRMATION:
+        print(f"   - Timeframes: {', '.join(MTF_TIMEFRAMES)}")
+        print(f"   - Require all aligned: {'Yes' if REQUIRE_ALL_TF_ALIGNED else 'No'}")
+        print(f"   - Min alignment: {MTF_MIN_ALIGNMENT_PCT}%")
     print("=" * 60)
 
     last_order_management_check = datetime.utcnow()

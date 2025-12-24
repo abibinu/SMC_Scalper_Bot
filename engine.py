@@ -273,3 +273,189 @@ def analyze_setup_quality(mss_type, order_block, fvg, confluence):
         "quality": quality,
         "factors": factors
     }
+
+def detect_trend(df, lookback=20):
+    """
+    Detects the current trend based on swing highs and lows.
+    
+    Args:
+        df: DataFrame with OHLC data
+        lookback: Number of candles to analyze
+    
+    Returns:
+        "bullish", "bearish", or "ranging"
+    """
+    recent_df = df.iloc[-lookback:]
+    
+    # Calculate swing points
+    recent_df = recent_df.copy()
+    recent_df['swing_high'] = (recent_df['high'] > recent_df['high'].shift(1)) & \
+                               (recent_df['high'] > recent_df['high'].shift(-1))
+    recent_df['swing_low'] = (recent_df['low'] < recent_df['low'].shift(1)) & \
+                              (recent_df['low'] < recent_df['low'].shift(-1))
+    
+    swing_highs = recent_df[recent_df['swing_high']]['high'].values
+    swing_lows = recent_df[recent_df['swing_low']]['low'].values
+    
+    if len(swing_highs) < 2 or len(swing_lows) < 2:
+        return "ranging"
+    
+    # Check if making higher highs and higher lows (bullish)
+    higher_highs = swing_highs[-1] > swing_highs[-2] if len(swing_highs) >= 2 else False
+    higher_lows = swing_lows[-1] > swing_lows[-2] if len(swing_lows) >= 2 else False
+    
+    # Check if making lower highs and lower lows (bearish)
+    lower_highs = swing_highs[-1] < swing_highs[-2] if len(swing_highs) >= 2 else False
+    lower_lows = swing_lows[-1] < swing_lows[-2] if len(swing_lows) >= 2 else False
+    
+    if higher_highs and higher_lows:
+        return "bullish"
+    elif lower_highs and lower_lows:
+        return "bearish"
+    else:
+        return "ranging"
+
+def get_mtf_structure(symbol, timeframes=[mt5.TIMEFRAME_M5, mt5.TIMEFRAME_M15], lookback=50):
+    """
+    Analyzes market structure across multiple timeframes.
+    
+    Args:
+        symbol: Trading symbol
+        timeframes: List of MT5 timeframes to analyze
+        lookback: Number of candles to analyze per timeframe
+    
+    Returns:
+        Dictionary with structure analysis for each timeframe
+    """
+    mtf_analysis = {}
+    
+    for tf in timeframes:
+        df = get_ohlc_data(symbol, tf, count=lookback)
+        
+        # Detect trend
+        trend = detect_trend(df, lookback=min(20, lookback))
+        
+        # Detect MSS on this timeframe
+        mss_type, _ = detect_mss_and_sl(df)
+        
+        # Find Order Block on this timeframe
+        ob = find_order_block(df, mss_type, lookback=min(20, lookback)) if mss_type else None
+        
+        # Get timeframe name
+        tf_name = get_timeframe_name(tf)
+        
+        mtf_analysis[tf_name] = {
+            "timeframe": tf,
+            "trend": trend,
+            "mss": mss_type,
+            "has_ob": ob is not None,
+            "ob": ob
+        }
+    
+    return mtf_analysis
+
+def get_timeframe_name(timeframe):
+    """Convert MT5 timeframe constant to readable name."""
+    tf_map = {
+        mt5.TIMEFRAME_M1: "M1",
+        mt5.TIMEFRAME_M5: "M5",
+        mt5.TIMEFRAME_M15: "M15",
+        mt5.TIMEFRAME_M30: "M30",
+        mt5.TIMEFRAME_H1: "H1",
+        mt5.TIMEFRAME_H4: "H4",
+        mt5.TIMEFRAME_D1: "D1"
+    }
+    return tf_map.get(timeframe, "Unknown")
+
+def check_mtf_alignment(m1_signal, mtf_analysis, require_all_aligned=False):
+    """
+    Checks if M1 signal aligns with higher timeframe structure.
+    
+    Args:
+        m1_signal: Direction of M1 signal ("bullish" or "bearish")
+        mtf_analysis: Dictionary from get_mtf_structure()
+        require_all_aligned: If True, all timeframes must align
+    
+    Returns:
+        Dictionary with alignment details
+    """
+    if not m1_signal:
+        return {"aligned": False, "reason": "No M1 signal"}
+    
+    aligned_timeframes = []
+    misaligned_timeframes = []
+    ranging_timeframes = []
+    
+    for tf_name, data in mtf_analysis.items():
+        trend = data['trend']
+        mss = data['mss']
+        
+        # Check alignment: either trend or MSS matches M1 signal
+        is_aligned = (trend == m1_signal) or (mss == m1_signal)
+        is_ranging = (trend == "ranging")
+        
+        if is_aligned:
+            aligned_timeframes.append(tf_name)
+        elif is_ranging:
+            ranging_timeframes.append(tf_name)
+        else:
+            misaligned_timeframes.append(tf_name)
+    
+    total_tfs = len(mtf_analysis)
+    aligned_count = len(aligned_timeframes)
+    
+    # Ranging is neutral - not against us
+    neutral_count = len(ranging_timeframes)
+    
+    # Calculate alignment strength
+    if require_all_aligned:
+        is_aligned = aligned_count == total_tfs
+    else:
+        # At least 50% must be aligned or ranging
+        is_aligned = (aligned_count + neutral_count) >= (total_tfs * 0.5)
+    
+    alignment_pct = (aligned_count / total_tfs * 100) if total_tfs > 0 else 0
+    
+    # Determine strength
+    if alignment_pct >= 100:
+        strength = "PERFECT"
+    elif alignment_pct >= 50:
+        strength = "STRONG"
+    elif alignment_pct >= 30:
+        strength = "WEAK"
+    else:
+        strength = "POOR"
+    
+    return {
+        "aligned": is_aligned,
+        "strength": strength,
+        "alignment_pct": alignment_pct,
+        "aligned_tfs": aligned_timeframes,
+        "ranging_tfs": ranging_timeframes,
+        "misaligned_tfs": misaligned_timeframes,
+        "total_tfs": total_tfs
+    }
+
+def calculate_mtf_score_bonus(mtf_alignment):
+    """
+    Calculates bonus score points for MTF alignment.
+    
+    Args:
+        mtf_alignment: Dictionary from check_mtf_alignment()
+    
+    Returns:
+        Bonus score (0-20 points)
+    """
+    if not mtf_alignment['aligned']:
+        return 0
+    
+    strength = mtf_alignment['strength']
+    
+    if strength == "PERFECT":
+        return 20
+    elif strength == "STRONG":
+        return 15
+    elif strength == "WEAK":
+        return 10
+    else:
+        return 5

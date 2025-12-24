@@ -19,7 +19,14 @@ ORDER_MANAGEMENT_CHECK_INTERVAL = 60  # Check orders every 60 seconds
 OB_LOOKBACK_CANDLES = 20  # How many candles to look back for Order Blocks
 MIN_CONFLUENCE_OVERLAP = 30  # Minimum overlap % between OB and FVG (30-100)
 REQUIRE_CONFLUENCE = False  # If True, only trade when OB+FVG confluence exists
-MIN_SETUP_QUALITY_SCORE = 60  # Minimum quality score to take trade (0-100)
+MIN_SETUP_QUALITY_SCORE = 65  # Minimum quality score to take trade (0-100)
+
+# -- Multi-Timeframe (MTF) Settings --
+ENABLE_MTF_CONFIRMATION = True  # Enable multi-timeframe analysis
+MTF_TIMEFRAMES = ["M5"]  # Timeframes to check (options: M5, M15, M30, H1)
+REQUIRE_ALL_TF_ALIGNED = False  # If True, all timeframes must align (stricter)
+MTF_MIN_ALIGNMENT_PCT = 30  # Minimum % of timeframes that must align (0-100)
+MTF_SCORE_BONUS = True  # Add bonus score for MTF alignment
 
 # -- MT5 Credentials --
 # It is mandatory to set the following environment variables:
