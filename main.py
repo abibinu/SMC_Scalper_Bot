@@ -11,14 +11,22 @@ from config import (
     REQUIRE_CONFLUENCE, MIN_SETUP_QUALITY_SCORE,
     ENABLE_MTF_CONFIRMATION, MTF_TIMEFRAMES,
     REQUIRE_ALL_TF_ALIGNED, MTF_MIN_ALIGNMENT_PCT,
-    MTF_SCORE_BONUS
+    MTF_SCORE_BONUS,
+    ENABLE_BREAKER_BLOCKS, BB_LOOKBACK_CANDLES,
+    BB_SCORE_BONUS, BB_MIN_QUALITY,
+    ENABLE_TELEGRAM, TELEGRAM_NOTIFY_SIGNALS,
+    TELEGRAM_NOTIFY_TRADES, TELEGRAM_NOTIFY_FILLS,
+    TELEGRAM_NOTIFY_BREAKEVEN, TELEGRAM_NOTIFY_CLOSES,
+    TELEGRAM_NOTIFY_SKIPS
 )
 from engine import (
     get_ohlc_data, detect_mss_and_sl, find_fvg,
     find_order_block, check_confluence, get_refined_entry,
     analyze_setup_quality, get_mtf_structure, check_mtf_alignment,
-    calculate_mtf_score_bonus
+    calculate_mtf_score_bonus, find_historical_order_blocks,
+    detect_breaker_block, enhance_setup_with_breaker_blocks
 )
+from telegram_notifier import TelegramNotifier
 from trading_functions import (
     mt5_connect, verify_demo_account, check_spread, 
     calculate_lot_size, execute_limit_order, is_position_open
@@ -43,7 +51,7 @@ def is_in_trading_session():
 def main():
     """Main function to run the trading bot."""
     print("=" * 60)
-    print("SMC Institutional Scalper Bot v3.0")
+    print("SMC Institutional Scalper Bot v4.0")
     print("=" * 60)
     
     mt5_connect()
@@ -58,6 +66,13 @@ def main():
         max_order_age_minutes=MAX_ORDER_AGE_MINUTES,
         breakeven_trigger_rr=BREAKEVEN_TRIGGER_RR
     )
+    
+    # Initialize Telegram Notifier
+    telegram = TelegramNotifier(enabled=ENABLE_TELEGRAM)
+    
+    # Test Telegram connection
+    if ENABLE_TELEGRAM:
+        telegram.test_connection()
     
     print(f"✓ Bot running on demo account")
     print(f"✓ Account Balance: ${account_info.balance:,.2f}")
@@ -76,7 +91,22 @@ def main():
         print(f"   - Timeframes: {', '.join(MTF_TIMEFRAMES)}")
         print(f"   - Require all aligned: {'Yes' if REQUIRE_ALL_TF_ALIGNED else 'No'}")
         print(f"   - Min alignment: {MTF_MIN_ALIGNMENT_PCT}%")
+    print(f"✓ Breaker Blocks: {'Enabled' if ENABLE_BREAKER_BLOCKS else 'Disabled'}")
+    if ENABLE_BREAKER_BLOCKS:
+        print(f"   - Lookback: {BB_LOOKBACK_CANDLES} candles")
+        print(f"   - Min quality: {BB_MIN_QUALITY}")
+    print(f"✓ Telegram Notifications: {'Enabled' if ENABLE_TELEGRAM else 'Disabled'}")
     print("=" * 60)
+    
+    # Send startup notification
+    if ENABLE_TELEGRAM:
+        settings = {
+            'ob_lookback': OB_LOOKBACK_CANDLES,
+            'min_quality': MIN_SETUP_QUALITY_SCORE,
+            'mtf_enabled': 'Yes' if ENABLE_MTF_CONFIRMATION else 'No',
+            'bb_enabled': 'Yes' if ENABLE_BREAKER_BLOCKS else 'No'
+        }
+        telegram.notify_bot_started(account_info.balance, SYMBOL, RISK_PER_TRADE, settings)
 
     last_order_management_check = datetime.utcnow()
     
@@ -91,14 +121,28 @@ def main():
             time_since_last_check = (now - last_order_management_check).total_seconds()
             if time_since_last_check >= ORDER_MANAGEMENT_CHECK_INTERVAL:
                 # Cancel old pending orders
+                pending_orders_before = order_manager.get_pending_orders(SYMBOL)
                 cancelled = order_manager.cancel_old_orders(SYMBOL)
                 if cancelled > 0:
                     print(f"🗑️  Cancelled {cancelled} expired order(s)")
+                    
+                    # Notify about cancelled orders
+                    if ENABLE_TELEGRAM and TELEGRAM_NOTIFY_TRADES:
+                        for order in pending_orders_before[:cancelled]:
+                            telegram.notify_order_cancelled(order.ticket, "Expired (30+ minutes)")
                 
                 # Move positions to breakeven
+                positions_before = {pos.ticket for pos in mt5.positions_get(symbol=SYMBOL) or []}
                 modified = order_manager.manage_breakeven(SYMBOL)
                 if modified > 0:
                     print(f"🎯 Moved {modified} position(s) to breakeven")
+                    
+                    # Notify about breakeven moves
+                    if ENABLE_TELEGRAM and TELEGRAM_NOTIFY_BREAKEVEN:
+                        positions_after = mt5.positions_get(symbol=SYMBOL) or []
+                        for pos in positions_after:
+                            if pos.ticket in positions_before and pos.ticket in order_manager.managed_positions:
+                                telegram.notify_breakeven_moved(pos.ticket, pos.symbol, pos.sl)
                 
                 # Cleanup closed positions from tracking
                 order_manager.cleanup_closed_positions()
