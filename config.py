@@ -5,10 +5,14 @@ MAGIC_NUMBER = 123456
 MAX_SPREAD_PIPS = 4.0  # Tighter spread requirement
 
 # -- Trading Session Times (UTC) --
-LONDON_SESSION_START = "08:00"  # Avoid London open volatility
+# NOTE: These are UTC times. MT5 server typically uses UTC.
+# If your broker uses different timezone, adjust accordingly.
+# London: 08:00-16:00 UTC (13:30-21:30 IST)
+# New York: 13:30-20:00 UTC (19:00-01:30 IST next day)
+LONDON_SESSION_START = "08:00"  # Avoid London open volatility (starts 30 min after open)
 LONDON_SESSION_END = "16:00"
-NEW_YORK_SESSION_START = "13:30"  # Avoid NY open volatility
-NEW_YORK_SESSION_END = "20:00"
+NEW_YORK_SESSION_START = "13:30"  # Avoid NY open volatility (starts 30 min after open)
+NEW_YORK_SESSION_END = "20:00"  # End before late NY session
 
 # -- Order Management Settings --
 MAX_ORDER_AGE_MINUTES = 20  # Shorter expiry for faster-moving M1
@@ -36,8 +40,8 @@ BB_MIN_QUALITY = "medium"
 
 # -- Volume & Volatility Filters --
 MIN_VOLUME_RATIO = 0.6  # Must be 60% of average volume (avoid dead markets)
-MIN_ATR_PIPS = 2.5  # Minimum 2.5 pips ATR (avoid low volatility)
-MAX_ATR_PIPS = 15.0  # Maximum 15 pips ATR (avoid extreme volatility)
+MIN_ATR_PIPS = 3.0  # Minimum 3.0 pips ATR (calculated on H1 for stability)
+MAX_ATR_PIPS = 20.0  # Maximum 20 pips ATR (avoid extreme volatility)
 
 # -- Dynamic Risk Management --
 ENABLE_DYNAMIC_RISK = True  # Scale position size based on setup quality

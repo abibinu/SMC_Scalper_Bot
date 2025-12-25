@@ -8,27 +8,38 @@ def get_ohlc_data(symbol, timeframe, count=100):
     df['time'] = pd.to_datetime(df['time'], unit='s')
     return df
 
-def calculate_atr(df, period=14):
+def calculate_atr(symbol, period=14, timeframe=mt5.TIMEFRAME_H1):
     """
     Calculate Average True Range for volatility filtering.
+    Uses H1 timeframe for more stable ATR calculation.
     
     Args:
-        df: DataFrame with OHLC data
+        symbol: Trading symbol
         period: ATR period (default: 14)
+        timeframe: Timeframe for ATR calculation (default: H1)
     
     Returns:
         ATR value as float
     """
+    # Fetch more data from H1 timeframe for better ATR calculation
+    df = get_ohlc_data(symbol, timeframe, count=period * 3)
+    
+    if len(df) < period:
+        return 0.0
+    
     high = df['high']
     low = df['low']
     close = df['close']
     
+    # Calculate True Range
     tr1 = high - low
     tr2 = abs(high - close.shift())
     tr3 = abs(low - close.shift())
     
     tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-    atr = tr.rolling(window=period).mean().iloc[-1]
+    
+    # Calculate ATR using exponential moving average
+    atr = tr.ewm(span=period, adjust=False).mean().iloc[-1]
     
     return atr
 
@@ -46,10 +57,13 @@ def calculate_volume_ratio(df, period=20):
     if 'tick_volume' not in df.columns:
         return 1.0
     
+    if len(df) < period + 1:
+        return 1.0
+    
     avg_volume = df['tick_volume'].rolling(window=period).mean().iloc[-2]
     current_volume = df['tick_volume'].iloc[-2]
     
-    if avg_volume == 0:
+    if avg_volume == 0 or pd.isna(avg_volume):
         return 1.0
     
     return current_volume / avg_volume

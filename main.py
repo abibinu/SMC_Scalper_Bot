@@ -27,6 +27,7 @@ from engine import (
     detect_breaker_block, enhance_setup_with_breaker_blocks,
     calculate_atr, calculate_volume_ratio
 )
+from pytz import timezone
 from telegram_notifier import TelegramNotifier
 from trading_functions import (
     mt5_connect, verify_demo_account, check_spread, 
@@ -56,9 +57,14 @@ def is_high_impact_news_time():
     return False
 
 def is_in_trading_session():
-    """Checks if the current time is within the London or New York trading sessions."""
-    utc_now = datetime.utcnow()
-    current_time = utc_now.time()
+    """
+    Checks if the current time is within the London or New York trading sessions.
+    MT5 server time is typically UTC or broker-specific, so we use UTC for consistency.
+    """
+    # Get server time from MT5 (more reliable than system time)
+    server_time_struct = mt5.symbol_info_tick(SYMBOL).time
+    server_time = datetime.utcfromtimestamp(server_time_struct)
+    current_time = server_time.time()
     
     london_start = dt_time.fromisoformat(LONDON_SESSION_START)
     london_end = dt_time.fromisoformat(LONDON_SESSION_END)
@@ -240,22 +246,23 @@ def main():
             # Fetch OHLC data
             df = get_ohlc_data(SYMBOL, mt5.TIMEFRAME_M1, count=100)
             
-            # Calculate ATR for volatility filter
-            atr = calculate_atr(df)
+            # Calculate ATR from H1 timeframe for better stability
+            atr = calculate_atr(SYMBOL, period=14, timeframe=mt5.TIMEFRAME_H1)
             point = mt5.symbol_info(SYMBOL).point
             atr_pips = atr / (point * 10)
             
             # Volume filter
             volume_ratio = calculate_volume_ratio(df)
             
-            # Skip in extremely low volatility
-            if atr_pips < 2.0:
-                print(f"⚠️  ATR too low ({atr_pips:.1f} pips). Skipping.")
+            # Skip in extremely low volatility (less than 3 pips ATR)
+            if atr_pips < 3.0:
+                # Only print this message every 30 minutes to reduce noise
+                if int(now.minute) % 30 == 0:
+                    print(f"⚠️  ATR too low ({atr_pips:.1f} pips). Market too quiet.")
                 continue
             
             # Skip in abnormally low volume
             if volume_ratio < 0.5:
-                print(f"⚠️  Volume too low ({volume_ratio:.2f}x avg). Skipping.")
                 continue
             
             # Detect MSS
