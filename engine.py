@@ -8,6 +8,52 @@ def get_ohlc_data(symbol, timeframe, count=100):
     df['time'] = pd.to_datetime(df['time'], unit='s')
     return df
 
+def calculate_atr(df, period=14):
+    """
+    Calculate Average True Range for volatility filtering.
+    
+    Args:
+        df: DataFrame with OHLC data
+        period: ATR period (default: 14)
+    
+    Returns:
+        ATR value as float
+    """
+    high = df['high']
+    low = df['low']
+    close = df['close']
+    
+    tr1 = high - low
+    tr2 = abs(high - close.shift())
+    tr3 = abs(low - close.shift())
+    
+    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+    atr = tr.rolling(window=period).mean().iloc[-1]
+    
+    return atr
+
+def calculate_volume_ratio(df, period=20):
+    """
+    Calculate current volume vs average volume.
+    
+    Args:
+        df: DataFrame with OHLC data
+        period: Period for average calculation (default: 20)
+    
+    Returns:
+        Volume ratio as float (1.0 = average, 2.0 = double average, etc.)
+    """
+    if 'tick_volume' not in df.columns:
+        return 1.0
+    
+    avg_volume = df['tick_volume'].rolling(window=period).mean().iloc[-2]
+    current_volume = df['tick_volume'].iloc[-2]
+    
+    if avg_volume == 0:
+        return 1.0
+    
+    return current_volume / avg_volume
+
 def detect_mss_and_sl(df):
     """
     Detects a Market Structure Shift (MSS) and returns the shift type and the stop loss level.

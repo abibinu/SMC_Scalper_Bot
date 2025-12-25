@@ -24,7 +24,8 @@ from engine import (
     find_order_block, check_confluence, get_refined_entry,
     analyze_setup_quality, get_mtf_structure, check_mtf_alignment,
     calculate_mtf_score_bonus, find_historical_order_blocks,
-    detect_breaker_block, enhance_setup_with_breaker_blocks
+    detect_breaker_block, enhance_setup_with_breaker_blocks,
+    calculate_atr, calculate_volume_ratio
 )
 from telegram_notifier import TelegramNotifier
 from trading_functions import (
@@ -32,6 +33,27 @@ from trading_functions import (
     calculate_lot_size, execute_limit_order, is_position_open
 )
 from order_manager import OrderManager
+
+def is_high_impact_news_time():
+    """
+    Check if we're within 30 minutes of major news events.
+    You should expand this with actual news calendar integration.
+    """
+    utc_now = datetime.utcnow()
+    current_time = utc_now.time()
+    
+    # Major news times (UTC) - expand this list
+    news_times = [
+        (dt_time(8, 0), dt_time(8, 30)),   # EUR news
+        (dt_time(12, 30), dt_time(13, 0)),  # USD news
+        (dt_time(14, 0), dt_time(14, 30)),  # FOMC minutes
+    ]
+    
+    for start, end in news_times:
+        if start <= current_time <= end:
+            return True
+    
+    return False
 
 def is_in_trading_session():
     """Checks if the current time is within the London or New York trading sessions."""
@@ -48,10 +70,73 @@ def is_in_trading_session():
     
     return in_london or in_ny
 
+def get_dynamic_risk_multiplier(setup_score, mtf_alignment=None, bb_confluence=None):
+    """
+    Adjust position size based on setup quality.
+    Higher quality = larger position (up to 1.5x base risk).
+    Lower quality = smaller position (down to 0.5x base risk).
+    """
+    base_multiplier = 1.0
+    
+    # Adjust based on setup score
+    if setup_score >= 95:
+        base_multiplier = 1.5
+    elif setup_score >= 85:
+        base_multiplier = 1.3
+    elif setup_score >= 75:
+        base_multiplier = 1.1
+    elif setup_score < 65:
+        base_multiplier = 0.7
+    elif setup_score < 55:
+        base_multiplier = 0.5
+    
+    # Bonus for MTF alignment
+    if mtf_alignment and mtf_alignment.get('strength') == 'PERFECT':
+        base_multiplier *= 1.1
+    
+    # Bonus for Breaker Block confluence
+    if bb_confluence and bb_confluence.get('quality') == 'high':
+        base_multiplier *= 1.1
+    
+    # Cap at 1.5x max
+    return min(base_multiplier, 1.5)
+
+def calculate_dynamic_tp(mss_type, entry, sl, atr, setup_score):
+    """
+    Calculate dynamic take profit based on volatility and setup quality.
+    Better setups get wider targets.
+    """
+    risk = abs(entry - sl)
+    
+    # Base R:R ratio
+    if setup_score >= 90:
+        rr_ratio = 3.0  # Excellent setups: 1:3
+    elif setup_score >= 75:
+        rr_ratio = 2.5  # Good setups: 1:2.5
+    else:
+        rr_ratio = 2.0  # Fair setups: 1:2
+    
+    # Adjust for volatility
+    # Higher ATR = more room to breathe
+    point = mt5.symbol_info(SYMBOL).point
+    sl_in_atr = risk / (atr * point)
+    
+    if sl_in_atr < 1.5:  # Tight stop relative to ATR
+        rr_ratio *= 0.9  # Reduce target slightly
+    
+    reward = risk * rr_ratio
+    
+    if mss_type == "bullish":
+        tp = entry + reward
+    else:
+        tp = entry - reward
+    
+    return tp, rr_ratio
+
 def main():
     """Main function to run the trading bot."""
     print("=" * 60)
-    print("SMC Institutional Scalper Bot v4.0")
+    print("SMC Institutional Scalper Bot v5.0 - Enhanced")
     print("=" * 60)
     
     mt5_connect()
@@ -76,26 +161,11 @@ def main():
     
     print(f"✓ Bot running on demo account")
     print(f"✓ Account Balance: ${account_info.balance:,.2f}")
-    print(f"✓ Account Equity: ${account_info.equity:,.2f}")
-    print(f"✓ Free Margin: ${account_info.margin_free:,.2f}")
     print(f"✓ Symbol: {SYMBOL}")
-    print(f"✓ Risk per trade: {RISK_PER_TRADE * 100}%")
-    print(f"✓ Order expiration: {MAX_ORDER_AGE_MINUTES} minutes")
-    print(f"✓ Breakeven trigger: {BREAKEVEN_TRIGGER_RR}:1 R:R")
-    print(f"✓ OB lookback: {OB_LOOKBACK_CANDLES} candles")
-    print(f"✓ Min confluence: {MIN_CONFLUENCE_OVERLAP}%")
-    print(f"✓ Require confluence: {'Yes' if REQUIRE_CONFLUENCE else 'No'}")
-    print(f"✓ Min setup quality: {MIN_SETUP_QUALITY_SCORE}/100")
+    print(f"✓ Base Risk: {RISK_PER_TRADE * 100}% (dynamic 0.5x-1.5x)")
+    print(f"✓ Dynamic TP: 2-3R based on quality")
     print(f"✓ MTF Confirmation: {'Enabled' if ENABLE_MTF_CONFIRMATION else 'Disabled'}")
-    if ENABLE_MTF_CONFIRMATION:
-        print(f"   - Timeframes: {', '.join(MTF_TIMEFRAMES)}")
-        print(f"   - Require all aligned: {'Yes' if REQUIRE_ALL_TF_ALIGNED else 'No'}")
-        print(f"   - Min alignment: {MTF_MIN_ALIGNMENT_PCT}%")
     print(f"✓ Breaker Blocks: {'Enabled' if ENABLE_BREAKER_BLOCKS else 'Disabled'}")
-    if ENABLE_BREAKER_BLOCKS:
-        print(f"   - Lookback: {BB_LOOKBACK_CANDLES} candles")
-        print(f"   - Min quality: {BB_MIN_QUALITY}")
-    print(f"✓ Telegram Notifications: {'Enabled' if ENABLE_TELEGRAM else 'Disabled'}")
     print("=" * 60)
     
     # Send startup notification
@@ -117,156 +187,254 @@ def main():
             next_candle = (now + timedelta(minutes=1)).replace(second=0, microsecond=0)
             sleep_seconds = (next_candle - now).total_seconds()
             
-            # Periodic order management checks (every ORDER_MANAGEMENT_CHECK_INTERVAL seconds)
+            # Periodic order management
             time_since_last_check = (now - last_order_management_check).total_seconds()
             if time_since_last_check >= ORDER_MANAGEMENT_CHECK_INTERVAL:
-                # Cancel old pending orders
                 pending_orders_before = order_manager.get_pending_orders(SYMBOL)
                 cancelled = order_manager.cancel_old_orders(SYMBOL)
-                if cancelled > 0:
-                    print(f"🗑️  Cancelled {cancelled} expired order(s)")
-                    
-                    # Notify about cancelled orders
-                    if ENABLE_TELEGRAM and TELEGRAM_NOTIFY_TRADES:
-                        for order in pending_orders_before[:cancelled]:
-                            telegram.notify_order_cancelled(order.ticket, "Expired (30+ minutes)")
+                if cancelled > 0 and ENABLE_TELEGRAM and TELEGRAM_NOTIFY_TRADES:
+                    for order in pending_orders_before[:cancelled]:
+                        telegram.notify_order_cancelled(order.ticket, "Expired")
                 
-                # Move positions to breakeven
                 positions_before = {pos.ticket for pos in mt5.positions_get(symbol=SYMBOL) or []}
                 modified = order_manager.manage_breakeven(SYMBOL)
-                if modified > 0:
-                    print(f"🎯 Moved {modified} position(s) to breakeven")
-                    
-                    # Notify about breakeven moves
-                    if ENABLE_TELEGRAM and TELEGRAM_NOTIFY_BREAKEVEN:
-                        positions_after = mt5.positions_get(symbol=SYMBOL) or []
-                        for pos in positions_after:
-                            if pos.ticket in positions_before and pos.ticket in order_manager.managed_positions:
-                                telegram.notify_breakeven_moved(pos.ticket, pos.symbol, pos.sl)
+                if modified > 0 and ENABLE_TELEGRAM and TELEGRAM_NOTIFY_BREAKEVEN:
+                    positions_after = mt5.positions_get(symbol=SYMBOL) or []
+                    for pos in positions_after:
+                        if pos.ticket in positions_before and pos.ticket in order_manager.managed_positions:
+                            telegram.notify_breakeven_moved(pos.ticket, pos.symbol, pos.sl)
                 
-                # Cleanup closed positions from tracking
                 order_manager.cleanup_closed_positions()
-                
                 last_order_management_check = now
             
             # Sleep until next candle
             time.sleep(max(1, sleep_seconds))
             
-            # Check if in trading session
+            # === PRE-TRADE FILTERS ===
+            
+            # 1. Check trading session
             if not is_in_trading_session():
                 continue
 
-            # Check if we already have a position or pending order
+            # 2. Check for existing positions/orders
             if is_position_open(SYMBOL):
                 continue
             
             pending_orders = order_manager.get_pending_orders(SYMBOL)
             if len(pending_orders) > 0:
                 continue
-                
-            # Check spread
+            
+            # 3. Spread filter
             if not check_spread(SYMBOL):
-                symbol_info = mt5.symbol_info(SYMBOL)
-                pip_value = symbol_info.point * 10  # For 5-digit brokers, 1 pip = 10 points
-                current_spread = (symbol_info.ask - symbol_info.bid) / pip_value
-                print(f"⚠️  Spread too high for {SYMBOL} ({current_spread:.1f} pips > {MAX_SPREAD_PIPS} pips), skipping")
+                continue
+            
+            # 4. High-impact news filter
+            if is_high_impact_news_time():
+                print("⚠️  High-impact news time. Skipping trade.")
+                if ENABLE_TELEGRAM and TELEGRAM_NOTIFY_SKIPS:
+                    telegram.notify_signal_skipped("High-impact news time")
                 continue
 
+            # === MARKET ANALYSIS ===
+            
             # Fetch OHLC data
             df = get_ohlc_data(SYMBOL, mt5.TIMEFRAME_M1, count=100)
+            
+            # Calculate ATR for volatility filter
+            atr = calculate_atr(df)
+            point = mt5.symbol_info(SYMBOL).point
+            atr_pips = atr / (point * 10)
+            
+            # Volume filter
+            volume_ratio = calculate_volume_ratio(df)
+            
+            # Skip in extremely low volatility
+            if atr_pips < 2.0:
+                print(f"⚠️  ATR too low ({atr_pips:.1f} pips). Skipping.")
+                continue
+            
+            # Skip in abnormally low volume
+            if volume_ratio < 0.5:
+                print(f"⚠️  Volume too low ({volume_ratio:.2f}x avg). Skipping.")
+                continue
             
             # Detect MSS
             mss_type, stop_loss = detect_mss_and_sl(df)
             
-            if mss_type:
-                # Find Order Block
-                order_block = find_order_block(df, mss_type, lookback=OB_LOOKBACK_CANDLES)
+            if not mss_type:
+                continue
+            
+            # Find Order Block
+            order_block = find_order_block(df, mss_type, lookback=OB_LOOKBACK_CANDLES)
+            
+            # Find FVG
+            fvg = find_fvg(df)
+            
+            # Check confluence
+            confluence = check_confluence(order_block, fvg, min_overlap_pct=MIN_CONFLUENCE_OVERLAP)
+            
+            # === MULTI-TIMEFRAME ANALYSIS ===
+            mtf_alignment = None
+            if ENABLE_MTF_CONFIRMATION:
+                # Convert timeframe strings to MT5 constants
+                tf_map = {
+                    "M5": mt5.TIMEFRAME_M5,
+                    "M15": mt5.TIMEFRAME_M15,
+                    "M30": mt5.TIMEFRAME_M30,
+                    "H1": mt5.TIMEFRAME_H1
+                }
+                mtf_timeframes = [tf_map[tf] for tf in MTF_TIMEFRAMES if tf in tf_map]
                 
-                # Find FVG
-                fvg = find_fvg(df)
+                mtf_structure = get_mtf_structure(SYMBOL, timeframes=mtf_timeframes)
+                mtf_alignment = check_mtf_alignment(mss_type, mtf_structure, 
+                                                     require_all_aligned=REQUIRE_ALL_TF_ALIGNED)
                 
-                # Check for confluence between OB and FVG
-                confluence = check_confluence(order_block, fvg, min_overlap_pct=MIN_CONFLUENCE_OVERLAP)
-                
-                # Analyze setup quality
-                setup_analysis = analyze_setup_quality(mss_type, order_block, fvg, confluence)
-                
-                # Apply filters
-                if REQUIRE_CONFLUENCE and not confluence:
-                    print(f"⚠️  {mss_type.upper()} MSS detected but no OB+FVG confluence. Skipping.")
+                # Filter out if MTF is misaligned
+                if mtf_alignment['alignment_pct'] < MTF_MIN_ALIGNMENT_PCT:
+                    print(f"⚠️  MTF misaligned ({mtf_alignment['alignment_pct']:.0f}%). Skipping.")
+                    if ENABLE_TELEGRAM and TELEGRAM_NOTIFY_SKIPS:
+                        telegram.notify_signal_skipped("MTF misalignment", 
+                                                       f"{mtf_alignment['alignment_pct']:.0f}%")
                     continue
+            
+            # === BREAKER BLOCK ANALYSIS ===
+            bb_confluence = None
+            if ENABLE_BREAKER_BLOCKS:
+                historical_obs = find_historical_order_blocks(df, lookback=BB_LOOKBACK_CANDLES)
+                breaker_blocks = detect_breaker_block(df, historical_obs, lookback=BB_LOOKBACK_CANDLES)
                 
-                if setup_analysis['score'] < MIN_SETUP_QUALITY_SCORE:
-                    print(f"⚠️  Setup quality too low ({setup_analysis['score']}/100). Skipping.")
-                    continue
-                
-                # At this point we have a valid setup
-                print(f"\n{'='*60}")
-                print(f"🎯 SIGNAL DETECTED: {mss_type.upper()} MSS")
-                print(f"{'='*60}")
-                print(f"📊 Setup Quality: {setup_analysis['quality']} ({setup_analysis['score']}/100)")
-                for factor in setup_analysis['factors']:
-                    print(f"   {factor}")
-                print(f"{'='*60}")
-                
-                # Determine entry price using refined logic
-                entry_price = get_refined_entry(order_block, fvg, confluence)
-                
-                if entry_price is None:
-                    print(f"❌ Could not determine entry price. Skipping.")
-                    continue
-                
-                # Display OB and FVG info
-                if order_block:
-                    print(f"📦 Order Block Zone: {order_block['low']:.5f} - {order_block['high']:.5f}")
-                if fvg:
-                    print(f"📊 FVG Zone: {fvg['low']:.5f} - {fvg['high']:.5f}")
-                if confluence:
-                    print(f"🎯 Confluence Zone: {confluence['overlap_low']:.5f} - {confluence['overlap_high']:.5f}")
-                    print(f"   Overlap: {confluence['overlap_pct']:.1f}% ({confluence['quality'].upper()})")
-                
-                # Calculate SL and TP
-                point = mt5.symbol_info(SYMBOL).point
-                sl_pips = abs(entry_price - stop_loss) / point
-                tp_pips = sl_pips * 2 # 1:2 Risk-to-Reward
-                
-                take_profit = entry_price + (tp_pips * point) if mss_type == "bullish" else entry_price - (tp_pips * point)
-
-                # Calculate Lot Size
-                account_info = mt5.account_info()
-                lot_size = calculate_lot_size(
-                    account_info.balance, 
-                    RISK_PER_TRADE, 
-                    sl_pips, 
-                    SYMBOL
+                if breaker_blocks:
+                    # Get refined entry first
+                    entry_price = get_refined_entry(order_block, fvg, confluence)
+                    if entry_price:
+                        bb_confluence = enhance_setup_with_breaker_blocks(mss_type, entry_price, breaker_blocks)
+                        
+                        if bb_confluence and bb_confluence.get('quality') == 'high':
+                            print(f"🔄 High-quality Breaker Block detected!")
+                            if ENABLE_TELEGRAM:
+                                bb = bb_confluence['best_bb']
+                                telegram.notify_breaker_block_detected(
+                                    bb['type'], bb['high'], bb['low'], bb['quality']
+                                )
+            
+            # === SETUP QUALITY ANALYSIS ===
+            setup_analysis = analyze_setup_quality(mss_type, order_block, fvg, confluence)
+            
+            # Add MTF bonus
+            if mtf_alignment and MTF_SCORE_BONUS:
+                mtf_bonus = calculate_mtf_score_bonus(mtf_alignment)
+                setup_analysis['score'] += mtf_bonus
+                setup_analysis['factors'].append(f"✓ MTF Bonus: +{mtf_bonus} pts")
+            
+            # Add BB bonus
+            if bb_confluence and BB_SCORE_BONUS:
+                bb_bonus = bb_confluence.get('bonus_score', 0)
+                setup_analysis['score'] += bb_bonus
+                setup_analysis['factors'].append(f"✓ BB Bonus: +{bb_bonus} pts")
+            
+            # Filter by minimum quality
+            if setup_analysis['score'] < MIN_SETUP_QUALITY_SCORE:
+                print(f"⚠️  Setup quality too low ({setup_analysis['score']}/100). Skipping.")
+                continue
+            
+            # Confluence requirement
+            if REQUIRE_CONFLUENCE and not confluence:
+                print(f"⚠️  No OB+FVG confluence. Skipping.")
+                continue
+            
+            # === VALID SETUP DETECTED ===
+            print(f"\n{'='*60}")
+            print(f"🎯 HIGH-QUALITY SIGNAL: {mss_type.upper()} MSS")
+            print(f"{'='*60}")
+            print(f"📊 Setup Score: {setup_analysis['quality']} ({setup_analysis['score']}/100)")
+            print(f"📈 ATR: {atr_pips:.1f} pips")
+            print(f"📊 Volume: {volume_ratio:.2f}x average")
+            
+            if mtf_alignment:
+                print(f"🔄 MTF: {mtf_alignment['strength']} ({mtf_alignment['alignment_pct']:.0f}%)")
+            
+            for factor in setup_analysis['factors']:
+                print(f"   {factor}")
+            print(f"{'='*60}")
+            
+            # Notify signal
+            if ENABLE_TELEGRAM and TELEGRAM_NOTIFY_SIGNALS:
+                telegram.notify_signal_detected(
+                    mss_type, 
+                    setup_analysis['score'], 
+                    setup_analysis['quality'],
+                    mtf_alignment
                 )
+            
+            # === TRADE EXECUTION ===
+            
+            # Determine entry
+            entry_price = get_refined_entry(order_block, fvg, confluence)
+            
+            if entry_price is None:
+                print(f"❌ Could not determine entry. Skipping.")
+                continue
+            
+            # Calculate dynamic TP
+            take_profit, rr_ratio = calculate_dynamic_tp(mss_type, entry_price, stop_loss, 
+                                                          atr, setup_analysis['score'])
+            
+            # Calculate dynamic lot size
+            sl_pips = abs(entry_price - stop_loss) / point
+            
+            risk_multiplier = get_dynamic_risk_multiplier(
+                setup_analysis['score'], 
+                mtf_alignment, 
+                bb_confluence
+            )
+            
+            adjusted_risk = RISK_PER_TRADE * risk_multiplier
+            
+            account_info = mt5.account_info()
+            lot_size = calculate_lot_size(
+                account_info.balance, 
+                adjusted_risk,
+                sl_pips, 
+                SYMBOL
+            )
+            
+            tp_pips = abs(take_profit - entry_price) / point
+            risk_amount = account_info.balance * adjusted_risk
+            potential_profit = risk_amount * rr_ratio
 
-                print(f"{'='*60}")
-                print(f"💰 Trade Details:")
-                print(f"   Entry: {entry_price:.5f}")
-                print(f"   SL: {stop_loss:.5f} ({sl_pips:.1f} pips)")
-                print(f"   TP: {take_profit:.5f} ({tp_pips:.1f} pips)")
-                print(f"   Lot Size: {lot_size}")
-                print(f"   Risk: ${account_info.balance * RISK_PER_TRADE:.2f}")
+            print(f"💰 Trade Details:")
+            print(f"   Entry: {entry_price:.5f}")
+            print(f"   SL: {stop_loss:.5f} ({sl_pips:.1f} pips)")
+            print(f"   TP: {take_profit:.5f} ({tp_pips:.1f} pips)")
+            print(f"   R:R: 1:{rr_ratio:.1f}")
+            print(f"   Lot Size: {lot_size}")
+            print(f"   Risk: ${risk_amount:.2f} ({adjusted_risk*100:.2f}%)")
+            print(f"   Potential: ${potential_profit:.2f}")
 
-                # Execute Trade
-                order_type = mt5.ORDER_TYPE_BUY_LIMIT if mss_type == "bullish" else mt5.ORDER_TYPE_SELL_LIMIT
-                result = execute_limit_order(
-                    order_type,
-                    SYMBOL, 
-                    lot_size, 
-                    entry_price, 
-                    stop_loss, 
-                    take_profit, 
-                    MAGIC_NUMBER
-                )
+            # Execute Trade
+            order_type = mt5.ORDER_TYPE_BUY_LIMIT if mss_type == "bullish" else mt5.ORDER_TYPE_SELL_LIMIT
+            result = execute_limit_order(
+                order_type,
+                SYMBOL, 
+                lot_size, 
+                entry_price, 
+                stop_loss, 
+                take_profit, 
+                MAGIC_NUMBER
+            )
+            
+            if result and result.retcode == mt5.TRADE_RETCODE_DONE:
+                print(f"✅ Order placed successfully (Ticket: #{result.order})")
                 
-                if result and result.retcode == mt5.TRADE_RETCODE_DONE:
-                    print(f"✅ Order placed successfully (Ticket: #{result.order})")
-                else:
-                    print(f"❌ Order failed: {result.comment if result else 'Unknown error'}")
-                
-                print(f"{'='*60}\n")
+                if ENABLE_TELEGRAM and TELEGRAM_NOTIFY_TRADES:
+                    telegram.notify_trade_placed(
+                        order_type, SYMBOL, entry_price, stop_loss, take_profit,
+                        lot_size, risk_amount, potential_profit, result.order
+                    )
+            else:
+                print(f"❌ Order failed: {result.comment if result else 'Unknown error'}")
+            
+            print(f"{'='*60}\n")
 
     except KeyboardInterrupt:
         print("\n\n🛑 Bot stopped by user.")
@@ -274,15 +442,16 @@ def main():
         print(f"\n❌ Unexpected error: {e}")
         import traceback
         traceback.print_exc()
+        
+        if ENABLE_TELEGRAM:
+            telegram.notify_error(str(e))
     finally:
-        # Final status report
         print("\n" + "=" * 60)
         print("📊 Final Status Report")
         print("=" * 60)
         status = order_manager.get_status_report(SYMBOL)
         print(f"Pending Orders: {status['pending_orders']}")
         print(f"Open Positions: {status['open_positions']}")
-        print(f"Managed Positions: {status['managed_positions']}")
         print("=" * 60)
         
         mt5.shutdown()
