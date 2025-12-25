@@ -2,8 +2,8 @@ import time
 import MetaTrader5 as mt5
 from datetime import datetime, time as dt_time, timedelta
 from config import (
-    SYMBOL, RISK_PER_TRADE, MAGIC_NUMBER, 
-    LONDON_SESSION_START, LONDON_SESSION_END, 
+    SYMBOL, RISK_PER_TRADE, MAGIC_NUMBER, MAX_SPREAD_PIPS,
+    LONDON_SESSION_START, LONDON_SESSION_END,
     NEW_YORK_SESSION_START, NEW_YORK_SESSION_END,
     MAX_ORDER_AGE_MINUTES, BREAKEVEN_TRIGGER_RR,
     ORDER_MANAGEMENT_CHECK_INTERVAL,
@@ -166,7 +166,10 @@ def main():
                 
             # Check spread
             if not check_spread(SYMBOL):
-                print(f"⚠️  Spread too high for {SYMBOL}, skipping")
+                symbol_info = mt5.symbol_info(SYMBOL)
+                pip_value = symbol_info.point * 10  # For 5-digit brokers, 1 pip = 10 points
+                current_spread = (symbol_info.ask - symbol_info.bid) / pip_value
+                print(f"⚠️  Spread too high for {SYMBOL} ({current_spread:.1f} pips > {MAX_SPREAD_PIPS} pips), skipping")
                 continue
 
             # Fetch OHLC data

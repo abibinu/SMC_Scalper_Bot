@@ -2,7 +2,7 @@
 SYMBOL = "EURUSD"
 RISK_PER_TRADE = 0.005 # 0.5% risk per trade
 MAGIC_NUMBER = 123456
-MAX_SPREAD_PIPS = 1.5
+MAX_SPREAD_PIPS = 6.0
 
 # -- Trading Session Times (UTC) --
 LONDON_SESSION_START = "07:00"

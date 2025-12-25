@@ -23,10 +23,13 @@ def verify_demo_account():
 def check_spread(symbol):
     """Checks if the current spread is within the acceptable range."""
     symbol_info = mt5.symbol_info(symbol)
-    if symbol_info is None:
-        print(f"Failed to get symbol info for {symbol}")
+    tick = mt5.symbol_info_tick(symbol)
+
+    if symbol_info is None or tick is None:
         return False
-    spread = (symbol_info.ask - symbol_info.bid) / symbol_info.point
+
+    pip_value = symbol_info.point * 10  # For 5-digit brokers, 1 pip = 10 points
+    spread = (tick.ask - tick.bid) / pip_value
     return spread <= MAX_SPREAD_PIPS
 
 def calculate_lot_size(account_balance, risk_per_trade, stop_loss_pips, symbol):
