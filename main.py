@@ -1,5 +1,8 @@
 import time
 import MetaTrader5 as mt5
+from risk_manager import RiskManager
+from news_calendar import NewsCalendar
+from trade_logger import TradeLogger
 from datetime import datetime, time as dt_time, timedelta
 from config import (
     SYMBOL, RISK_PER_TRADE, MAGIC_NUMBER, MAX_SPREAD_PIPS,
@@ -17,7 +20,10 @@ from config import (
     ENABLE_TELEGRAM, TELEGRAM_NOTIFY_SIGNALS,
     TELEGRAM_NOTIFY_TRADES, TELEGRAM_NOTIFY_FILLS,
     TELEGRAM_NOTIFY_BREAKEVEN, TELEGRAM_NOTIFY_CLOSES,
-    TELEGRAM_NOTIFY_SKIPS
+    TELEGRAM_NOTIFY_SKIPS, ENABLE_RISK_MANAGER, MAX_DAILY_LOSS_PCT, MAX_WEEKLY_LOSS_PCT,
+    MAX_DAILY_TRADES, RISK_STATE_FILE,
+    AVOID_HIGH_IMPACT_NEWS, NEWS_BUFFER_MINUTES, NEWS_CACHE_FILE,
+    ENABLE_TRADE_LOGGING, TRADE_DB_PATH, AUTO_CALCULATE_DAILY_PERFORMANCE
 )
 from engine import (
     get_ohlc_data, detect_mss_and_sl, find_fvg,
@@ -150,6 +156,30 @@ def main():
     
     # Get account info and display
     account_info = mt5.account_info()
+
+    # 1. Risk Manager
+    risk_manager = RiskManager(
+        max_daily_loss_pct=MAX_DAILY_LOSS_PCT,
+        max_weekly_loss_pct=MAX_WEEKLY_LOSS_PCT,
+        max_daily_trades=MAX_DAILY_TRADES,
+        state_file=RISK_STATE_FILE
+    ) if ENABLE_RISK_MANAGER else None
+    
+    # 2. News Calendar
+    news_calendar = NewsCalendar(
+        cache_file=NEWS_CACHE_FILE,
+        buffer_minutes=NEWS_BUFFER_MINUTES
+    ) if AVOID_HIGH_IMPACT_NEWS else None
+    
+    # Fetch today's news events
+    if news_calendar:
+        news_calendar.force_refresh()
+        news_calendar.print_todays_events()
+    
+    # 3. Trade Logger
+    trade_logger = TradeLogger(
+        db_path=TRADE_DB_PATH
+    ) if ENABLE_TRADE_LOGGING else None
     
     # Initialize Order Manager
     order_manager = OrderManager(
@@ -164,6 +194,10 @@ def main():
     # Test Telegram connection
     if ENABLE_TELEGRAM:
         telegram.test_connection()
+
+    # Print Risk Status
+    if risk_manager:
+        risk_manager.print_risk_status()
     
     print(f"✓ Bot running on demo account")
     print(f"✓ Account Balance: ${account_info.balance:,.2f}")
@@ -201,6 +235,18 @@ def main():
                 if cancelled > 0 and ENABLE_TELEGRAM and TELEGRAM_NOTIFY_TRADES:
                     for order in pending_orders_before[:cancelled]:
                         telegram.notify_order_cancelled(order.ticket, "Expired")
+
+                if trade_logger:
+                # Check for filled orders
+                    positions = mt5.positions_get(symbol=SYMBOL)
+                    if positions:
+                        for pos in positions:
+                            if pos.magic == MAGIC_NUMBER:
+                                # Update to active if it was pending
+                                trade_logger.update_trade_status(
+                                    pos.ticket, 
+                                    status='active'
+                                )
                 
                 positions_before = {pos.ticket for pos in mt5.positions_get(symbol=SYMBOL) or []}
                 modified = order_manager.manage_breakeven(SYMBOL)
@@ -217,6 +263,21 @@ def main():
             time.sleep(max(1, sleep_seconds))
             
             # === PRE-TRADE FILTERS ===
+
+            # 0. RISK MANAGER CHECK
+            if risk_manager:
+                can_trade, reason = risk_manager.can_trade()
+                if not can_trade:
+                    print(f"🛑 Trading suspended: {reason}")
+                    if telegram:
+                        telegram.send_message(f"🛑 <b>Trading Suspended</b>\n\n{reason}")
+                    
+                    # Sleep for 5 minutes before checking again
+                    time.sleep(300)
+                    continue
+                
+                # Update high watermarks periodically
+                risk_manager.update_high_watermarks()
             
             # 1. Check trading session
             if not is_in_trading_session():
@@ -234,12 +295,14 @@ def main():
             if not check_spread(SYMBOL):
                 continue
             
-            # 4. High-impact news filter
-            if is_high_impact_news_time():
-                print("⚠️  High-impact news time. Skipping trade.")
-                if ENABLE_TELEGRAM and TELEGRAM_NOTIFY_SKIPS:
-                    telegram.notify_signal_skipped("High-impact news time")
-                continue
+            # 4. High-impact news filter (UPDATED)
+            if news_calendar:
+                is_news, reason = news_calendar.is_high_impact_news_time()
+                if is_news:
+                    print(f"⚠️  High-impact news: {reason}")
+                    if ENABLE_TELEGRAM and TELEGRAM_NOTIFY_SKIPS:
+                        telegram.notify_signal_skipped("High-impact news", reason)
+                    continue
 
             # === MARKET ANALYSIS ===
             
@@ -432,6 +495,41 @@ def main():
             
             if result and result.retcode == mt5.TRADE_RETCODE_DONE:
                 print(f"✅ Order placed successfully (Ticket: #{result.order})")
+
+            if trade_logger:
+            # Prepare setup analysis for logging
+                setup_for_log = {
+                    'score': setup_analysis['score'],
+                    'quality': setup_analysis['quality'],
+                    'ob_present': order_block is not None,
+                    'fvg_present': fvg is not None,
+                    'confluence_pct': confluence.get('overlap_pct', 0) if confluence else 0,
+                    'confluence_quality': confluence.get('quality', None) if confluence else None
+                }
+                
+                trade_logger.log_trade_signal(
+                    ticket_number=result.order,
+                    symbol=SYMBOL,
+                    direction=mss_type,
+                    entry_price=entry_price,
+                    stop_loss=stop_loss,
+                    take_profit=take_profit,
+                    lot_size=lot_size,
+                    setup_analysis=setup_for_log,
+                    mtf_alignment=mtf_alignment,
+                    bb_confluence=bb_confluence,
+                    risk_amount=risk_amount,
+                    risk_pct=adjusted_risk,
+                    risk_multiplier=risk_multiplier,
+                    rr_ratio=rr_ratio,
+                    atr_pips=atr_pips,
+                    volume_ratio=volume_ratio,
+                    spread_pips=0  # Calculate if needed
+                )
+        
+            # ============ Record Trade in Risk Manager (NEW) ============
+            if risk_manager:
+                risk_manager.record_trade()
                 
                 if ENABLE_TELEGRAM and TELEGRAM_NOTIFY_TRADES:
                     telegram.notify_trade_placed(
@@ -459,6 +557,17 @@ def main():
         status = order_manager.get_status_report(SYMBOL)
         print(f"Pending Orders: {status['pending_orders']}")
         print(f"Open Positions: {status['open_positions']}")
+        if risk_manager:
+         risk_manager.print_risk_status()
+    
+        # Trade Performance
+        if trade_logger:
+            print("\n" + "=" * 60)
+            trade_logger.print_performance_report(days=7)
+            
+            # Calculate today's performance
+            if AUTO_CALCULATE_DAILY_PERFORMANCE:
+                trade_logger.calculate_daily_performance()
         print("=" * 60)
         
         mt5.shutdown()
